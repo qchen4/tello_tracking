@@ -97,7 +97,7 @@ python hsv_calibrator.py
 
 - [ ] PID-based motion smoothing
 - [ ] Obstacle avoidance
-- [ ] AprilTag / ArUco integration
+- [ ] Yolo integration
 - [ ] Voice-command control
 
 ---
