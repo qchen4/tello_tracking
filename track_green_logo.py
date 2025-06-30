@@ -1,139 +1,222 @@
 """
-Tello Drone Green Object Tracker (OpenCV + HSV)
+Tello Drone Object Tracker (Configurable HSV + Presets)
 
-This script controls a DJI Tello drone using computer vision to detect and track a green-colored object 
-in real time. It captures frames from the drone's camera, processes the image to identify green regions,
-and issues movement commands to align the object with the center of the frame.
+This script uses computer vision to track a colored object using a DJI Tello drone.
+You can either select from built-in color presets or load custom HSV thresholds from a JSON config.
 
 Features:
-- Real-time green object detection via HSV thresholding
-- Automatic movement: left/right and up/down based on position offset
-- Visual feedback via OpenCV windows
-- Safe landing and resource cleanup on exit
+- Real-time object tracking based on HSV masking
+- User prompt to choose default or tuned HSV config
+- Modular detection logic
+- Command-line control: takeoff, start tracking, land, exit
+- Safe landing and resource cleanup on quit
 
-Author: [Qiyue Chen]
-Date: [2025-06-30]
+Author: Qiyue Chen
+Date: 2025-06-30
 """
 
-from djitellopy import Tello
 import cv2
 import numpy as np
 import time
+import json
+from djitellopy import Tello
 
 # ---------------------------------------------
-# Drone Setup
+# HSV Color Presets
 # ---------------------------------------------
 
-# Initialize the Tello drone
-tello = Tello()
-tello.connect()         # Establish connection
-tello.streamon()        # Start video stream
-
-# Take off and wait briefly for stabilization
-tello.takeoff()
-time.sleep(2)
-
-# ---------------------------------------------
-# Frame and Center Configuration
-# ---------------------------------------------
-
-# Define frame dimensions and center coordinates
-frame_width = 640
-frame_height = 480
-center_x = frame_width // 2
-center_y = frame_height // 2
-
-# Define movement tolerance: drone won't move if object is near center
-tolerance = 40  # pixels
+COLOR_PRESETS = {
+    "green": {
+        "lower": [40, 70, 70],
+        "upper": [80, 255, 255]
+    },
+    "red": {
+        "lower": [0, 120, 70],
+        "upper": [10, 255, 255]
+    },
+    "blue": {
+        "lower": [100, 150, 0],
+        "upper": [140, 255, 255]
+    }
+}
 
 # ---------------------------------------------
-# Object Detection Function
+# Load HSV Configuration
 # ---------------------------------------------
 
-def find_green_object(frame):
+def load_hsv_config():
     """
-    Detect the largest green-colored object in a frame using HSV masking.
-
-    Parameters:
-        frame (np.array): BGR image from the drone camera
+    Prompt user to select a color or load a custom config from hsv_config.json.
 
     Returns:
-        tuple: (x, y) center coordinates of object or None if not found,
-               binary mask used for detection
+        tuple: lower and upper HSV bounds as NumPy arrays
     """
-    # Convert BGR image to HSV color space
+    print("Select tracking color:")
+    print("1 - Green (default)")
+    print("2 - Red")
+    print("3 - Blue")
+    print("4 - Load from hsv_config.json")
+
+    choice = input("Enter choice [1-4]: ").strip()
+
+    if choice == '1':
+        hsv = COLOR_PRESETS["green"]
+    elif choice == '2':
+        hsv = COLOR_PRESETS["red"]
+    elif choice == '3':
+        hsv = COLOR_PRESETS["blue"]
+    elif choice == '4':
+        try:
+            with open("hsv_config.json", "r") as f:
+                hsv = json.load(f)
+        except Exception as e:
+            print("Failed to load hsv_config.json:", e)
+            print("Falling back to green.")
+            hsv = COLOR_PRESETS["green"]
+    else:
+        print("Invalid input. Using default green.")
+        hsv = COLOR_PRESETS["green"]
+
+    lower = np.array(hsv["lower"])
+    upper = np.array(hsv["upper"])
+    return lower, upper
+
+# ---------------------------------------------
+# Object Detection
+# ---------------------------------------------
+
+def detect_object(frame, lower, upper):
+    """
+    Detect the largest object matching the HSV mask in the frame.
+
+    Parameters:
+        frame (np.ndarray): Input BGR frame from the drone
+        lower (np.ndarray): Lower HSV threshold
+        upper (np.ndarray): Upper HSV threshold
+
+    Returns:
+        tuple: (x, y) of object center if found, and the binary mask
+    """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-    # Define HSV thresholds for green color
-    lower_green = np.array([40, 70, 70])
-    upper_green = np.array([80, 255, 255])
-
-    # Create a binary mask where green is white and other areas are black
-    mask = cv2.inRange(hsv, lower_green, upper_green)
-
-    # Find contours from the mask
+    mask = cv2.inRange(hsv, lower, upper)
     contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
     if contours:
-        # Choose the largest contour (assume it's the object)
         c = max(contours, key=cv2.contourArea)
-
-        # Ignore small objects (noise)
         if cv2.contourArea(c) > 300:
             x, y, w, h = cv2.boundingRect(c)
-            center = (x + w // 2, y + h // 2)
-            return center, mask
-
+            return (x + w // 2, y + h // 2), mask
     return None, mask
 
 # ---------------------------------------------
-# Main Tracking Loop
+# Main Function
 # ---------------------------------------------
 
-try:
-    while True:
-        # Read the latest frame from the drone
-        frame = tello.get_frame_read().frame
+def main():
+    # Load HSV thresholds
+    lower_hsv, upper_hsv = load_hsv_config()
 
-        # Resize for faster processing and consistent shape
-        frame = cv2.resize(frame, (frame_width, frame_height))
+    # Initialize Tello
+    tello = Tello()
+    tello.connect()
+    tello.streamon()
 
-        # Detect green object and get the binary mask
-        center, mask = find_green_object(frame)
+    # Frame settings
+    frame_width, frame_height = 640, 480
+    center_x, center_y = frame_width // 2, frame_height // 2
+    tolerance = 40  # pixel offset tolerance
 
-        if center:
-            # Draw a green dot at the object center
-            cv2.circle(frame, center, 10, (0, 255, 0), -1)
+    print("\n--- Tello Tracker Commands ---")
+    print("Type one of the following commands:")
+    print("[takeoff]    - Launch drone")
+    print("[start]      - Start object tracking")
+    print("[land]       - Land the drone")
+    print("[exit]       - Exit program\n")
 
-            # Calculate horizontal (X) and vertical (Y) error
-            offset_x = center[0] - center_x
-            offset_y = center_y - center[1]  # Invert Y because image origin is top-left
+    flying = False
+    tracking = False
 
-            # Adjust drone position based on X error (left/right)
-            if offset_x < -tolerance:
-                tello.move_left(20)
-            elif offset_x > tolerance:
-                tello.move_right(20)
+    try:
+        while True:
+            # Read user input
+            cmd = input("Command > ").strip().lower()
 
-            # Adjust drone position based on Y error (up/down)
-            if offset_y > tolerance:
-                tello.move_up(20)
-            elif offset_y < -tolerance:
-                tello.move_down(20)
+            if cmd == "takeoff":
+                if not flying:
+                    tello.takeoff()
+                    flying = True
+                    print("Drone has taken off.")
+                else:
+                    print("Drone is already flying.")
 
-        # Show the processed frames
-        cv2.imshow("Tello Stream", frame)
-        cv2.imshow("Mask", mask)
+            elif cmd == "start":
+                if not flying:
+                    print("Please take off before starting tracking.")
+                    continue
+                print("Starting object tracking...")
+                tracking = True
 
-        # Quit the loop when 'q' is pressed
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+                # Tracking loop
+                while tracking:
+                    frame = tello.get_frame_read().frame
+                    frame = cv2.resize(frame, (frame_width, frame_height))
+
+                    center, mask = detect_object(frame, lower_hsv, upper_hsv)
+
+                    if center:
+                        cv2.circle(frame, center, 10, (0, 255, 0), -1)
+
+                        offset_x = center[0] - center_x
+                        offset_y = center_y - center[1]
+
+                        if offset_x < -tolerance:
+                            tello.move_left(20)
+                        elif offset_x > tolerance:
+                            tello.move_right(20)
+
+                        if offset_y > tolerance:
+                            tello.move_up(20)
+                        elif offset_y < -tolerance:
+                            tello.move_down(20)
+
+                    cv2.imshow("Tello View", frame)
+                    cv2.imshow("Mask", mask)
+
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        print("Exiting tracking mode.")
+                        tracking = False
+                        break
+
+                # Close OpenCV windows when tracking ends
+                if cv2.getWindowProperty("Tello View", cv2.WND_PROP_VISIBLE) >= 1:
+                    cv2.destroyAllWindows()
+
+            elif cmd == "land":
+                if flying:
+                    tello.land()
+                    flying = False
+                    print("Drone landed.")
+                else:
+                    print("Drone is not flying.")
+
+            elif cmd == "exit":
+                break
+
+            else:
+                print("Unknown command. Try: takeoff, start, land, exit")
+
+    finally:
+        if flying:
+            tello.land()
+        tello.streamoff()
+        if cv2.getWindowProperty("Tello View", cv2.WND_PROP_VISIBLE) >= 1:
+            cv2.destroyAllWindows()
+        print("Shut down complete.")
 
 # ---------------------------------------------
-# Safe Exit
+# Entry Point
 # ---------------------------------------------
-finally:
-    # Land the drone and clean up resources
-    tello.land()
-    tello.streamoff()
-    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
